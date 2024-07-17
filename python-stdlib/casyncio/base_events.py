@@ -318,7 +318,7 @@ class BaseEventLoop(events.AbstractEventLoop):
         epoch, precision, accuracy and drift are unspecified and may
         differ per event loop.
         """
-        return time.ticks_us() * 1e-6
+        return time.monotonic()
 
     def call_later(self, delay, callback, *args, context=None):
         """Arrange for a callback to be called at a given time.

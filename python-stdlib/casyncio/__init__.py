@@ -31,7 +31,8 @@ from .locks import Lock, Event, Condition, Semaphore, BoundedSemaphore, Barrier
 # from .protocols import *
 from .runners import Runner, run
 from .queues import Queue, PriorityQueue, LifoQueue, QueueFull, QueueEmpty
-from .mp_streams import stream_wait, stream_read, stream_readinto, stream_write, Stream
+# from .mp_streams import stream_wait, stream_read, stream_readinto, stream_write, Stream
+from .streams import (StreamReader, StreamWriter, open_connection, start_server)
 
 # from .subprocess import *
 from .tasks import (

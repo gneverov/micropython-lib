@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Python-2.0
 
 """Event loop and event loop policy."""
+import threading
+
 from . import format_helpers
 
 
@@ -141,7 +143,7 @@ class AbstractEventLoop:
 
 
 # A TLS for the running event loop, used by _get_running_loop.
-class _RunningLoop:
+class _RunningLoop(threading.local):
     loop_pid = None
 
 
@@ -182,7 +184,7 @@ def _set_running_loop(loop):
     _running_loop.loop_pid = loop
 
 
-class _Local:
+class _Local(threading.local):
     _loop = None
     _set_called = False
 

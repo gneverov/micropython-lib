@@ -9,9 +9,9 @@ def _is_debug_mode():
     return False
 
 
-# def iscoroutinefunction(func):
-#     """Return True if func is a decorated coroutine function."""
-#     return NotImplementedError()
+def iscoroutinefunction(func):
+    """Return True if func is a decorated coroutine function."""
+    return False
 
 
 def iscoroutine(obj):

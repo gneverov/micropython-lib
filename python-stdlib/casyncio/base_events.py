@@ -17,10 +17,17 @@ to modify the meaning of the API call itself.
 """
 
 from . import deque as collections
+import errno
 from . import heapq
+import itertools
+import socket
 import time
-
 # import traceback
+
+try:
+    import ssl
+except ImportError:  # pragma: no cover
+    ssl = None
 
 # from . import constants
 from . import coroutines
@@ -44,8 +51,10 @@ _MIN_SCHEDULED_TIMER_HANDLES = 100
 
 # Minimum fraction of _scheduled timer handles that are cancelled
 # before cleanup of cancelled handles is performed.
+
 _MIN_CANCELLED_TIMER_HANDLES_FRACTION = 0.5
 
+_HAS_IPv6 = hasattr(socket, 'AF_INET6')
 
 # Maximum timeout passed to select to avoid OS limitations
 MAXIMUM_SELECT_TIMEOUT = 24 * 3600
@@ -60,6 +69,62 @@ def _format_handle(handle):
         return str(handle)
 
 
+def _set_reuseport(sock):
+    raise ValueError('reuse_port not supported by socket module')
+
+
+def _ipaddr_info(host, port, family, type, proto, flowinfo=0, scopeid=0):
+    # Try to skip getaddrinfo if "host" is already an IP. Users might have
+    # handled name resolution in their own code and pass in resolved IPs.
+    if proto not in {0, socket.IPPROTO_TCP, socket.IPPROTO_UDP} or \
+            host is None:
+        return None
+
+    if type == socket.SOCK_STREAM:
+        proto = socket.IPPROTO_TCP
+    elif type == socket.SOCK_DGRAM:
+        proto = socket.IPPROTO_UDP
+    else:
+        return None
+
+    if port is None:
+        port = 0
+    elif isinstance(port, bytes) and port == b'':
+        port = 0
+    elif isinstance(port, str) and port == '':
+        port = 0
+    else:
+        # If port's a service name like "http", don't skip getaddrinfo.
+        try:
+            port = int(port)
+        except (TypeError, ValueError):
+            return None
+
+    if family == socket.AF_UNSPEC:
+        afs = [socket.AF_INET]
+        if _HAS_IPv6:
+            afs.append(socket.AF_INET6)
+    else:
+        afs = [family]
+
+    if isinstance(host, bytes):
+        host = host.decode('idna')
+
+    for af in afs:
+        try:
+            socket.inet_pton(af, host)
+            # The host has already been resolved.
+            if _HAS_IPv6 and af == socket.AF_INET6:
+                return af, type, proto, '', (host, port, flowinfo, scopeid)
+            else:
+                return af, type, proto, '', (host, port)
+        except OSError:
+            pass
+
+    # "host" is not an IP address.
+    return None
+
+
 def _run_until_complete_cb(fut):
     if not fut.cancelled():
         exc = fut.exception()
@@ -68,6 +133,150 @@ def _run_until_complete_cb(fut):
             # stop it.
             return
     fut.get_loop().stop()
+
+
+def _check_ssl_socket(sock):
+    if ssl is not None and isinstance(sock, ssl.SSLSocket):
+        raise TypeError("Socket cannot be of type SSLSocket")
+    
+
+class Server:
+
+    def __init__(self, loop, sockets, protocol_factory, ssl_context, backlog,
+                 ssl_handshake_timeout):
+        self._loop = loop
+        self._sockets = sockets
+        # Weak references so we don't break Transport's ability to
+        # detect abandoned transports
+        self._clients = set()
+        self._waiters = []
+        self._protocol_factory = protocol_factory
+        self._backlog = backlog
+        self._ssl_context = ssl_context
+        self._ssl_handshake_timeout = ssl_handshake_timeout
+        self._serving = False
+        self._serving_forever_fut = None
+
+    def __repr__(self):
+        return f'<{self.__class__.__name__} sockets={self.sockets!r}>'
+
+    def _attach(self, transport):
+        assert self._sockets is not None
+        self._clients.add(transport)
+
+    def _detach(self, transport):
+        self._clients.discard(transport)
+        if len(self._clients) == 0 and self._sockets is None:
+            self._wakeup()
+
+    def _wakeup(self):
+        waiters = self._waiters
+        self._waiters = None
+        for waiter in waiters:
+            if not waiter.done():
+                waiter.set_result(None)
+
+    def _start_serving(self):
+        if self._serving:
+            return
+        self._serving = True
+        for sock in self._sockets:
+            sock.listen(self._backlog)
+            self._loop._start_serving(
+                self._protocol_factory, sock, self._ssl_context,
+                self, self._backlog, self._ssl_handshake_timeout)
+
+    def get_loop(self):
+        return self._loop
+
+    def is_serving(self):
+        return self._serving
+
+    @property
+    def sockets(self):
+        if self._sockets is None:
+            return ()
+        return tuple(self._sockets)
+
+    def close(self):
+        sockets = self._sockets
+        if sockets is None:
+            return
+        self._sockets = None
+
+        for sock in sockets:
+            self._loop._stop_serving(sock)
+
+        self._serving = False
+
+        if (self._serving_forever_fut is not None and
+                not self._serving_forever_fut.done()):
+            self._serving_forever_fut.cancel()
+            self._serving_forever_fut = None
+
+        if len(self._clients) == 0:
+            self._wakeup()
+
+    async def start_serving(self):
+        self._start_serving()
+        # Skip one loop iteration so that all 'loop.add_reader'
+        # go through.
+        await tasks.sleep(0)
+
+    async def serve_forever(self):
+        if self._serving_forever_fut is not None:
+            raise RuntimeError(
+                f'server {self!r} is already being awaited on serve_forever()')
+        if self._sockets is None:
+            raise RuntimeError(f'server {self!r} is closed')
+
+        self._start_serving()
+        self._serving_forever_fut = self._loop.create_future()
+
+        try:
+            await self._serving_forever_fut
+        except exceptions.CancelledError:
+            try:
+                self.close()
+                await self.wait_closed()
+            finally:
+                raise
+        finally:
+            self._serving_forever_fut = None
+
+    async def wait_closed(self):
+        """Wait until server is closed and all connections are dropped.
+
+        - If the server is not closed, wait.
+        - If it is closed, but there are still active connections, wait.
+
+        Anyone waiting here will be unblocked once both conditions
+        (server is closed and all connections have been dropped)
+        have become true, in either order.
+
+        Historical note: In 3.11 and before, this was broken, returning
+        immediately if the server was already closed, even if there
+        were still active connections. An attempted fix in 3.12.0 was
+        still broken, returning immediately if the server was still
+        open and there were no active connections. Hopefully in 3.12.1
+        we have it right.
+        """
+        # Waiters are unblocked by self._wakeup(), which is called
+        # from two places: self.close() and self._detach(), but only
+        # when both conditions have become true. To signal that this
+        # has happened, self._wakeup() sets self._waiters to None.
+        if self._waiters is None:
+            return
+        waiter = self._loop.create_future()
+        self._waiters.append(waiter)
+        await waiter
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        self.close()
+        await self.wait_closed()
 
 
 class BaseEventLoop(events.AbstractEventLoop):
@@ -416,6 +625,352 @@ class BaseEventLoop(events.AbstractEventLoop):
         self._write_to_self()
         return handle
 
+    async def getaddrinfo(
+            self, host, port, *,
+            family=0, type=0, proto=0, flags=0):
+        # return await self.run_in_executor(
+        #     None, socket.getaddrinfo, host, port, family, type, proto, flags)
+        return socket.getaddrinfo(host, port, family, type, proto, flags)
+
+    async def _connect_sock(self, exceptions, addr_info, local_addr_infos=None):
+        """Create, bind and connect one socket."""
+        my_exceptions = []
+        exceptions.append(my_exceptions)
+        family, type_, proto, _, address = addr_info
+        sock = None
+        try:
+            sock = socket.socket(family=family, type=type_, proto=proto)
+            sock.setblocking(False)
+            if local_addr_infos is not None:
+                for lfamily, _, _, _, laddr in local_addr_infos:
+                    # skip local addresses of different family
+                    if lfamily != family:
+                        continue
+                    try:
+                        sock.bind(laddr)
+                        break
+                    except OSError as exc:
+                        msg = (
+                            f'error while attempting to bind on address {laddr!r}: {str(exc).lower()}'
+                        )
+                        exc = OSError(exc.errno, msg)
+                        my_exceptions.append(exc)
+                else:  # all bind attempts failed
+                    if my_exceptions:
+                        raise my_exceptions.pop()
+                    else:
+                        raise OSError(f"no matching local address with {family=} found")
+            await self.sock_connect(sock, address)
+            return sock
+        except OSError as exc:
+            my_exceptions.append(exc)
+            if sock is not None:
+                sock.close()
+            raise
+        except:
+            if sock is not None:
+                sock.close()
+            raise
+        finally:
+            exceptions = my_exceptions = None
+
+    async def create_connection(
+            self, host=None, port=None,
+            *, ssl=None, family=0,
+            proto=0, flags=0, sock=None,
+            local_addr=None, server_hostname=None,
+            ssl_handshake_timeout=None):
+        """Connect to a TCP server.
+
+        Create a streaming transport connection to a given internet host and
+        port: socket family AF_INET or socket.AF_INET6 depending on host (or
+        family if specified), socket type SOCK_STREAM.
+
+        This method is a coroutine which will try to establish the connection
+        in the background.  When successful, the coroutine returns a
+        (transport, protocol) pair.
+        """
+        if server_hostname is not None and not ssl:
+            raise ValueError('server_hostname is only meaningful with ssl')
+
+        if server_hostname is None and ssl:
+            # Use host as default for server_hostname.  It is an error
+            # if host is empty or not set, e.g. when an
+            # already-connected socket was passed or when only a port
+            # is given.  To avoid this error, you can pass
+            # server_hostname='' -- this will bypass the hostname
+            # check.  (This also means that if host is a numeric
+            # IP/IPv6 address, we will attempt to verify that exact
+            # address; this will probably fail, but it is possible to
+            # create a certificate for a specific IP address, so we
+            # don't judge it here.)
+            if not host:
+                raise ValueError(
+                    'You must set server_hostname when using ssl without a host')
+            server_hostname = host
+
+        if ssl_handshake_timeout is not None and not ssl:
+            raise ValueError(
+                'ssl_handshake_timeout is only meaningful with ssl')
+
+        if sock is not None:
+            _check_ssl_socket(sock)
+
+        if host is not None or port is not None:
+            if sock is not None:
+                raise ValueError(
+                    'host/port and sock can not be specified at the same time')
+
+            infos = await self._ensure_resolved(
+                (host, port), family=family,
+                type=socket.SOCK_STREAM, proto=proto, flags=flags, loop=self)
+            if not infos:
+                raise OSError('getaddrinfo() returned empty list')
+
+            if local_addr is not None:
+                laddr_infos = await self._ensure_resolved(
+                    local_addr, family=family,
+                    type=socket.SOCK_STREAM, proto=proto,
+                    flags=flags, loop=self)
+                if not laddr_infos:
+                    raise OSError('getaddrinfo() returned empty list')
+            else:
+                laddr_infos = None
+
+            exceptions = []
+            # not using happy eyeballs
+            for addrinfo in infos:
+                try:
+                    sock = await self._connect_sock(
+                        exceptions, addrinfo, laddr_infos)
+                    break
+                except OSError:
+                    continue
+
+            if sock is None:
+                exceptions = [exc for sub in exceptions for exc in sub]
+                try:
+                    if len(exceptions) == 1:
+                        raise exceptions[0]
+                    else:
+                        # If they all have the same str(), raise one.
+                        model = str(exceptions[0])
+                        if all(str(exc) == model for exc in exceptions):
+                            raise exceptions[0]
+                        # Raise a combined exception so the user can see all
+                        # the various error messages.
+                        raise OSError('Multiple exceptions: {}'.format(
+                            ', '.join(str(exc) for exc in exceptions)))
+                finally:
+                    exceptions = None
+
+        else:
+            if sock is None:
+                raise ValueError(
+                    'host and port was not specified and no sock specified')
+            if sock.type != socket.SOCK_STREAM:
+                # We allow AF_INET, AF_INET6, AF_UNIX as long as they
+                # are SOCK_STREAM.
+                # We support passing AF_UNIX sockets even though we have
+                # a dedicated API for that: create_unix_connection.
+                # Disallowing AF_UNIX in this method, breaks backwards
+                # compatibility.
+                raise ValueError(
+                    f'A Stream Socket was expected, got {sock!r}')
+
+        transport = await self._create_connection_transport(
+            sock, ssl, server_hostname,
+            ssl_handshake_timeout=ssl_handshake_timeout)
+        return transport
+
+    async def _create_connection_transport(
+            self, sock, ssl,
+            server_hostname, server_side=False,
+            ssl_handshake_timeout=None):
+
+        sock.setblocking(False)
+
+        if ssl:
+            sslcontext = None if isinstance(ssl, bool) else ssl
+            transport = self._make_ssl_transport(
+                sock, sslcontext,
+                server_side=server_side, server_hostname=server_hostname,
+                ssl_handshake_timeout=ssl_handshake_timeout)
+        else:
+            transport = self._make_socket_transport(sock)
+
+        return transport
+
+    async def _ensure_resolved(self, address, *,
+                               family=0, type=socket.SOCK_STREAM,
+                               proto=0, flags=0, loop):
+        host, port = address[:2]
+        info = _ipaddr_info(host, port, family, type, proto, *address[2:])
+        if info is not None:
+            # "host" is already a resolved IP.
+            return [info]
+        else:
+            return await loop.getaddrinfo(host, port, family=family, type=type,
+                                          proto=proto, flags=flags)
+
+    async def _create_server_getaddrinfo(self, host, port, family, flags):
+        infos = await self._ensure_resolved((host, port), family=family,
+                                            type=socket.SOCK_STREAM,
+                                            flags=flags, loop=self)
+        if not infos:
+            raise OSError(f'getaddrinfo({host!r}) returned empty list')
+        return infos
+
+    async def create_server(
+            self, protocol_factory, host=None, port=None,
+            *,
+            family=socket.AF_UNSPEC,
+            flags=socket.AI_PASSIVE,
+            sock=None,
+            backlog=100,
+            ssl=None,
+            reuse_address=True,
+            reuse_port=None,
+            ssl_handshake_timeout=None,
+            start_serving=True):
+        """Create a TCP server.
+
+        The host parameter can be a string, in that case the TCP server is
+        bound to host and port.
+
+        The host parameter can also be a sequence of strings and in that case
+        the TCP server is bound to all hosts of the sequence. If a host
+        appears multiple times (possibly indirectly e.g. when hostnames
+        resolve to the same IP address), the server is only bound once to that
+        host.
+
+        Return a Server object which can be used to stop the service.
+
+        This method is a coroutine.
+        """
+        if isinstance(ssl, bool):
+            raise TypeError('ssl argument must be an SSLContext or None')
+
+        if ssl_handshake_timeout is not None and ssl is None:
+            raise ValueError(
+                'ssl_handshake_timeout is only meaningful with ssl')
+
+        if sock is not None:
+            _check_ssl_socket(sock)
+
+        if host is not None or port is not None:
+            if sock is not None:
+                raise ValueError(
+                    'host/port and sock can not be specified at the same time')
+
+            sockets = []
+            if host == '':
+                hosts = [None]
+            elif (isinstance(host, str) or
+                  not isinstance(host, collections.abc.Iterable)):
+                hosts = [host]
+            else:
+                hosts = host
+
+            fs = [self._create_server_getaddrinfo(host, port, family=family,
+                                                  flags=flags)
+                  for host in hosts]
+            infos = await tasks.gather(*fs)
+            infos = set(itertools.chain(*infos))
+
+            completed = False
+            try:
+                for res in infos:
+                    af, socktype, proto, canonname, sa = res
+                    try:
+                        sock = socket.socket(af, socktype, proto)
+                    except socket.error:
+                        # Assume it's a bad family/type/protocol combination.
+                        if self._debug:
+                            logger.warning('create_server() failed to create '
+                                           'socket.socket(%r, %r, %r)',
+                                           af, socktype, proto, exc_info=True)
+                        continue
+                    sockets.append(sock)
+                    if reuse_address:
+                        sock.setsockopt(
+                            socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    if reuse_port:
+                        _set_reuseport(sock)
+                    # Disable IPv4/IPv6 dual stack support (enabled by
+                    # default on Linux) which makes a single socket
+                    # listen on both address families.
+                    if (_HAS_IPv6 and
+                            af == socket.AF_INET6 and
+                            hasattr(socket, 'IPPROTO_IPV6')):
+                        sock.setsockopt(socket.IPPROTO_IPV6,
+                                        socket.IPV6_V6ONLY,
+                                        1)
+                    try:
+                        sock.bind(sa)
+                    except OSError as err:
+                        msg = ('error while attempting '
+                               'to bind on address %r: %s'
+                               % (sa, str(err).lower()))
+                        if err.errno == errno.EADDRNOTAVAIL:
+                            # Assume the family is not enabled (bpo-30945)
+                            sockets.pop()
+                            sock.close()
+                            if self._debug:
+                                logger.warning(msg)
+                            continue
+                        raise OSError(err.errno, msg) from None
+
+                if not sockets:
+                    raise OSError('could not bind on any address out of %r'
+                                  % ([info[4] for info in infos],))
+
+                completed = True
+            finally:
+                if not completed:
+                    for sock in sockets:
+                        sock.close()
+        else:
+            if sock is None:
+                raise ValueError('Neither host/port nor sock were specified')
+            if sock.type != socket.SOCK_STREAM:
+                raise ValueError(f'A Stream Socket was expected, got {sock!r}')
+            sockets = [sock]
+
+        for sock in sockets:
+            sock.setblocking(False)
+
+        server = Server(self, sockets, protocol_factory,
+                        ssl, backlog, ssl_handshake_timeout)
+        if start_serving:
+            server._start_serving()
+            # Skip one loop iteration so that all 'loop.add_reader'
+            # go through.
+            await tasks.sleep(0)
+
+        if self._debug:
+            logger.info("%r is serving", server)
+        return server
+
+    async def connect_accepted_socket(
+            self, sock,
+            *, ssl=None,
+            ssl_handshake_timeout=None):
+        if sock.type != socket.SOCK_STREAM:
+            raise ValueError(f'A Stream Socket was expected, got {sock!r}')
+
+        if ssl_handshake_timeout is not None and not ssl:
+            raise ValueError(
+                'ssl_handshake_timeout is only meaningful with ssl')
+
+        if sock is not None:
+            _check_ssl_socket(sock)
+
+        transport = await self._create_connection_transport(
+            sock, ssl, '', server_side=True,
+            ssl_handshake_timeout=ssl_handshake_timeout)
+        return transport
+    
     def get_exception_handler(self):
         """Return an exception handler, or None if the default one is in use."""
         return self._exception_handler

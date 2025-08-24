@@ -905,7 +905,7 @@ _current_tasks = {}
 
 def _register_task(task):
     """Register a new task in asyncio as executed by loop."""
-    _all_tasks.add(task)
+    # _all_tasks.add(task)
 
 
 def _enter_task(loop, task):
@@ -928,4 +928,4 @@ def _leave_task(loop, task):
 
 def _unregister_task(task):
     """Unregister a task."""
-    _all_tasks.discard(task)
+    # _all_tasks.discard(task)

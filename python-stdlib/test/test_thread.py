@@ -1,0 +1,144 @@
+import os
+import unittest
+import random
+from test import support
+import _thread as thread
+import time
+import sys
+
+from test import lock_tests
+
+NUMTASKS = 10
+NUMTRIPS = 3
+POLL_SLEEP = 0.010 # seconds = 10 ms
+
+_print_mutex = thread.allocate_lock()
+
+def verbose_print(arg):
+    """Helper function for printing out debugging output."""
+    if support.verbose:
+        with _print_mutex:
+            print(arg)
+
+
+class BasicThreadTest(unittest.TestCase):
+
+    def setUp(self):
+        self.done_mutex = thread.allocate_lock()
+        self.done_mutex.acquire()
+        self.running_mutex = thread.allocate_lock()
+        self.random_mutex = thread.allocate_lock()
+        self.created = 0
+        self.running = 0
+        self.next_ident = 0
+
+        key = support.threading_setup()
+        self.addCleanup(support.threading_cleanup, *key)
+
+
+class ThreadRunningTests(BasicThreadTest):
+
+    def newtask(self):
+        with self.running_mutex:
+            self.next_ident += 1
+            verbose_print("creating task %s" % self.next_ident)
+            thread.start_new_thread(self.task, (self.next_ident,))
+            self.created += 1
+            self.running += 1
+
+    def task(self, ident):
+        with self.random_mutex:
+            delay = random.random() / 10000.0
+        verbose_print("task %s will run for %sus" % (ident, round(delay*1e6)))
+        time.sleep(delay)
+        verbose_print("task %s done" % ident)
+        with self.running_mutex:
+            self.running -= 1
+            if self.created == NUMTASKS and self.running == 0:
+                self.done_mutex.release()
+
+    def test_starting_threads(self):
+        with support.wait_threads_exit():
+            # Basic test for thread creation.
+            for i in range(NUMTASKS):
+                self.newtask()
+            verbose_print("waiting for tasks to complete...")
+            self.done_mutex.acquire()
+            verbose_print("all tasks done")
+
+    def test_stack_size(self):
+        # Various stack size tests.
+        self.assertEqual(thread.stack_size(), 0, "initial stack size is not 0")
+
+        thread.stack_size(0)
+        self.assertEqual(thread.stack_size(), 0, "stack_size not reset to default")
+
+
+class Barrier:
+    def __init__(self, num_threads):
+        self.num_threads = num_threads
+        self.waiting = 0
+        self.checkin_mutex  = thread.allocate_lock()
+        self.checkout_mutex = thread.allocate_lock()
+        self.checkout_mutex.acquire()
+
+    def enter(self):
+        self.checkin_mutex.acquire()
+        self.waiting = self.waiting + 1
+        if self.waiting == self.num_threads:
+            self.waiting = self.num_threads - 1
+            self.checkout_mutex.release()
+            return
+        self.checkin_mutex.release()
+
+        self.checkout_mutex.acquire()
+        self.waiting = self.waiting - 1
+        if self.waiting == 0:
+            self.checkin_mutex.release()
+            return
+        self.checkout_mutex.release()
+
+
+class BarrierTest(BasicThreadTest):
+
+    def test_barrier(self):
+        with support.wait_threads_exit():
+            self.bar = Barrier(NUMTASKS)
+            self.running = NUMTASKS
+            for i in range(NUMTASKS):
+                thread.start_new_thread(self.task2, (i,))
+            verbose_print("waiting for tasks to end")
+            self.done_mutex.acquire()
+            verbose_print("tasks done")
+
+    def task2(self, ident):
+        for i in range(NUMTRIPS):
+            if ident == 0:
+                # give it a good chance to enter the next
+                # barrier before the others are all out
+                # of the current one
+                delay = 0
+            else:
+                with self.random_mutex:
+                    delay = random.random() / 10000.0
+            verbose_print("task %s will run for %sus" %
+                          (ident, round(delay * 1e6)))
+            time.sleep(delay)
+            verbose_print("task %s entering %s" % (ident, i))
+            self.bar.enter()
+            verbose_print("task %s leaving barrier" % ident)
+        with self.running_mutex:
+            self.running -= 1
+            # Must release mutex before releasing done, else the main thread can
+            # exit and set mutex to None as part of global teardown; then
+            # mutex.release() raises AttributeError.
+            finished = self.running == 0
+        if finished:
+            self.done_mutex.release()
+
+class LockTests(lock_tests.LockTests):
+    locktype = staticmethod(thread.allocate_lock)
+
+
+if __name__ == "__main__":
+    unittest.main()

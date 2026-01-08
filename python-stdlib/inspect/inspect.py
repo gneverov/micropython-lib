@@ -28,11 +28,8 @@ class _Class:
         pass
 
 
-_Instance = _Class()
-
-
 def ismethod(obj):
-    return isinstance(obj, type(_Instance.meth))
+    return isinstance(obj, type(_Class().meth))
 
 
 def isclass(obj):

@@ -3,93 +3,22 @@
 
 # https://github.com/python/cpython/blob/31c9f3ced293492b38e784c17c4befe425da5dab/Lib/http/client.py
 
-r"""HTTP/1.1 client library
-
-<intro stuff goes here>
-<other stuff, too>
-
-HTTPConnection goes through a number of "states", which define when a client
-may legally make another request or fetch the response for a particular
-request. This diagram details these state transitions:
-
-    (null)
-      |
-      | HTTPConnection()
-      v
-    Idle
-      |
-      | putrequest()
-      v
-    Request-started
-      |
-      | ( putheader() )*  endheaders()
-      v
-    Request-sent
-      |\_____________________________
-      |                              | getresponse() raises
-      | response = getresponse()     | ConnectionError
-      v                              v
-    Unread-response                Idle
-    [Response-headers-read]
-      |\____________________
-      |                     |
-      | response.read()     | putrequest()
-      v                     v
-    Idle                  Req-started-unread-response
-                     ______/|
-                   /        |
-   response.read() |        | ( putheader() )*  endheaders()
-                   v        v
-       Request-started    Req-sent-unread-response
-                            |
-                            | response.read()
-                            v
-                          Request-sent
-
-This diagram presents the following rules:
-  -- a second request may not be started until {response-headers-read}
-  -- a response [object] cannot be retrieved until {request-sent}
-  -- there is no differentiation between an unread response body and a
-     partially read response body
-
-Note: this enforcement is applied by the HTTPConnection class. The
-      HTTPResponse class does not enforce this state machine, which
-      implies sophisticated clients may accelerate the request/response
-      pipeline. Caution should be taken, though: accelerating the states
-      beyond the above pattern may imply knowledge of the server's
-      connection-close behavior for certain requests. For example, it
-      is impossible to tell whether the server will close the connection
-      UNTIL the response headers have been read; this means that further
-      requests cannot be placed into the pipeline until it is known that
-      the server will NOT be closing the connection.
-
-Logical State                  __state            __response
--------------                  -------            ----------
-Idle                           _CS_IDLE           None
-Request-started                _CS_REQ_STARTED    None
-Request-sent                   _CS_REQ_SENT       None
-Unread-response                _CS_IDLE           <response_class>
-Req-started-unread-response    _CS_REQ_STARTED    <response_class>
-Req-sent-unread-response       _CS_REQ_SENT       <response_class>
-"""
-
 import errno
 import http
 import io
 import re
 import socket
-import sys
-# from urllib.parse import urlsplit
+from urllib.parse import urlsplit
 
 # HTTPMessage, parse_headers(), and the HTTP status code constants are
 # intentionally omitted for simplicity
-__all__ = ["HTTPResponse", "HTTPConnection",
+__all__ = ("HTTPResponse", "HTTPConnection",
            "HTTPException", "NotConnected", "UnknownProtocol",
            "UnknownTransferEncoding", "UnimplementedFileMode",
            "IncompleteRead", "InvalidURL", "ImproperConnectionState",
            "CannotSendRequest", "CannotSendHeader", "ResponseNotReady",
-           "BadStatusLine", "LineTooLong", "RemoteDisconnected", "error",
-           "responses"]
+           "BadStatusLine", "LineTooLong", "RemoteDisconnected",
+           "responses")
 
 HTTP_PORT = 80
 HTTPS_PORT = 443
@@ -102,59 +31,40 @@ _CS_REQ_STARTED = 'Request-started'
 _CS_REQ_SENT = 'Request-sent'
 
 # maximal line length when calling readline().
-_MAXLINE = 4096
+_MAXLINE = 1000
 _MAXHEADERS = 100
-
-# Header name/value ABNF (http://tools.ietf.org/html/rfc7230#section-3.2)
-#
-# VCHAR          = %x21-7E
-# obs-text       = %x80-FF
-# header-field   = field-name ":" OWS field-value OWS
-# field-name     = token
-# field-value    = *( field-content / obs-fold )
-# field-content  = field-vchar [ 1*( SP / HTAB ) field-vchar ]
-# field-vchar    = VCHAR / obs-text
-#
-# obs-fold       = CRLF 1*( SP / HTAB )
-#                ; obsolete line folding
-#                ; see Section 3.2.4
-
-# token          = 1*tchar
-#
-# tchar          = "!" / "#" / "$" / "%" / "&" / "'" / "*"
-#                / "+" / "-" / "." / "^" / "_" / "`" / "|" / "~"
-#                / DIGIT / ALPHA
-#                ; any VCHAR, except delimiters
-#
-# VCHAR defined in http://tools.ietf.org/html/rfc5234#appendix-B.1
 
 # the patterns for both name and value are more lenient than RFC
 # definitions to allow for backwards compatibility
 _is_legal_header_name = re.compile(b'[^:\s][^:\r\n]*$').match
-_is_illegal_header_value = re.compile(b'\n[^ \t]|\r[^ \t\n]').search
+_is_illegal_header_value = re.compile(b'\n([^ \t]|$)|\r([^ \t\n]|$)').search
 
 # These characters are not allowed within HTTP URL paths.
 #  See https://tools.ietf.org/html/rfc3986#section-3.3 and the
 #  https://tools.ietf.org/html/rfc3986#appendix-A pchar definition.
 # Prevents CVE-2019-9740.  Includes control characters such as \r\n.
 # We don't restrict chars above \x7f as putrequest() limits us to ASCII.
-_contains_disallowed_url_pchar_re = lambda ch: (ch <= '\x20') or (ch == '\x7f')
+# _contains_disallowed_url_pchar_re = re.compile('[\x00-\x20\x7f]')
+def _contains_disallowed_url_pchar_re(url):
+    return [ch for ch in url if ord(ch) <= 0x20 and ord(ch) != 0x7f]
 # Arguably only these _should_ allowed:
 #  _is_allowed_url_pchars_re = re.compile(r"^[/!$&'()*+,;=:@%a-zA-Z0-9._~-]+$")
 # We are more lenient for assumed real world compatibility purposes.
 
 # These characters are not allowed within HTTP method names
 # to prevent http header injection.
-_contains_disallowed_method_pchar_re = lambda ch: ch < '\x20'
+# _contains_disallowed_method_pchar_re = re.compile('[\x00-\x1f]')
+def _contains_disallowed_method_pchar_re(method):
+    return [ch for ch in method if ord(ch) < 0x20]
 
 # We always set the Content-Length header for these methods because some
 # servers will otherwise respond with a 411
-_METHODS_EXPECTING_BODY = {'PATCH', 'POST', 'PUT'}
+_METHODS_EXPECTING_BODY = frozenset({'PATCH', 'POST', 'PUT'})
 
 
 def _encode(data, name='data'):
     """Call data.encode("latin-1") but show a better error message."""
-    return data.encode()
+    return data.encode("latin-1")
 
 def _strip_ipv6_iface(enc_name: bytes) -> bytes:
     """Remove interface scope from IPv6 address."""
@@ -163,6 +73,65 @@ def _strip_ipv6_iface(enc_name: bytes) -> bytes:
         assert enc_name.startswith(b'['), enc_name
         enc_name += b']'
     return enc_name
+
+
+class HTTPMessage:
+    def __init__(self):
+        self._headers = []
+
+    def __len__(self):
+        return len(self._headers)
+
+    def __getitem__(self, name):
+        return self.get(name)
+
+    def __setitem__(self, name, val):
+        self._headers.append((name, val))
+
+    def __delitem__(self, name):
+        name = name.lower()
+        self._headers = [(k, v) for k, v in self._headers if k.lower() != name]
+
+    def __contains__(self, name):
+        return self.get(name) is not None
+
+    def __iter__(self):
+        for field, value in self._headers:
+            yield field
+
+    def keys(self):
+        return [k for k, v in self._headers]
+
+    def values(self):
+        return [v for k, v in self._headers]
+
+    def items(self):
+        return [(k, v) for k, v in self._headers]
+
+    def get(self, name, failobj=None):
+        name = name.lower()
+        for k, v in self._headers:
+            if k.lower() == name:
+                return v
+        return failobj
+
+    def get_all(self, name, failobj=None):
+        name = name.lower()
+        values = [v for k, v in self._headers if k.lower() == name]
+        return values if values else failobj
+
+    def add_header(self, _name, _value):
+        self[_name] = _value
+
+    def replace_header(self, _name, _value):
+        _name = _name.lower()
+        for i, (k, v) in enumerate(self._headers):
+            if k.lower() == _name:
+                self._headers[i] = (k, _value)
+                break
+        else:
+            raise KeyError(_name)
+
 
 def _read_headers(fp):
     """Reads potential header lines into a list from a file pointer.
@@ -182,24 +151,27 @@ def _read_headers(fp):
             break
     return headers
 
-def parse_headers(fp):
-    """Parses only RFC2822 headers from a file pointer.
+def _parse_header_lines(header_lines, _class=HTTPMessage):
+    """Parses only RFC2822 headers from header lines."""
 
-    email Parser wants to see strings rather than bytes.
-    But a TextIOWrapper around self.rfile would buffer too many bytes
-    from the stream, bytes which we later need to read as bytes.
-    So we read the correct bytes here, as bytes, for email Parser
-    to parse.
-
-    """
-    headers = {}
-    for hstring in _read_headers(fp):
-        if hstring in (b'\r\n', b'\n', b''):
-            continue
-        hstring = str(hstring, "iso-8859-1")
-        header, value = hstring.split(':', 1)
-        headers[header.strip().lower()] = value.strip()
+    headers = _class()
+    last_name = None
+    for hstring in header_lines:
+        hstring = hstring.decode("iso-8859-1")
+        parts = hstring.split(':', 1)
+        if hstring and hstring[0] in (' ', '\t'):
+            if last_name is not None:
+                headers.replace_header(last_name, headers[last_name] + hstring.rstrip())
+        elif len(parts) > 1 and parts[0]:
+            last_name = parts[0].strip()
+            headers.add_header(last_name, parts[1].strip())
     return headers
+
+def parse_headers(fp, _class=HTTPMessage):
+    """Parses only RFC2822 headers from a file pointer."""
+
+    headers = _read_headers(fp)
+    return _parse_header_lines(headers, _class)
 
 
 class HTTPResponse(io.IOBase):
@@ -212,6 +184,7 @@ class HTTPResponse(io.IOBase):
     # accepts iso-8859-1.
 
     def __init__(self, sock, debuglevel=0, method=None, url=None):
+        super(HTTPResponse, self).__init__()
         # If the response includes a content-length header, we need to
         # make sure that the client doesn't read more than the
         # specified number of bytes.  If it does, it will block until
@@ -387,10 +360,6 @@ class HTTPResponse(io.IOBase):
             if self.fp:
                 self._close_conn()
 
-    def settimeout(self, timeout):
-        if self.fp:
-            self.fp.settimeout(timeout)
-
     # These implementations are for the benefit of io.BufferedReader.
 
     # XXX This class should probably be revised to act more like
@@ -429,7 +398,7 @@ class HTTPResponse(io.IOBase):
         if self.chunked:
             return self._read_chunked(amt)
 
-        if amt is not None:
+        if amt is not None and amt >= 0:
             if self.length is not None and amt > self.length:
                 # clip the read to the "end of response"
                 amt = self.length
@@ -547,6 +516,8 @@ class HTTPResponse(io.IOBase):
 
     def _read_chunked(self, amt=None):
         assert self.chunked != _UNKNOWN
+        if amt is not None and amt < 0:
+            amt = None
         value = []
         try:
             while True:
@@ -739,6 +710,20 @@ class HTTPResponse(io.IOBase):
         '''
         return self.status
 
+
+def _create_https_context(http_version):
+    # Function also used by urllib.request to be able to set the check_hostname
+    # attribute on a context object.
+    context = ssl.create_default_context()
+    # send ALPN extension to indicate HTTP/1.1 protocol
+    if ssl.HAS_ALPN and http_version == 11:
+        context.set_alpn_protocols(['http/1.1'])
+    # enable PHA for TLS 1.3 connections if available
+    # if context.post_handshake_auth is not None:
+    #     context.post_handshake_auth = True
+    return context
+
+
 class HTTPConnection:
 
     _http_vsn = 11
@@ -753,7 +738,8 @@ class HTTPConnection:
     def _is_textIO(stream):
         """Test whether a file-like object is a text or a binary stream.
         """
-        return isinstance(stream, io.TextIOBase)
+        # return isinstance(stream, io.TextIOBase)
+        return False
 
     @staticmethod
     def _get_content_length(body, method):
@@ -775,6 +761,9 @@ class HTTPConnection:
             # file-like object.
             return None
 
+        if isinstance(body, str):
+            return len(body)
+
         try:
             # does it implement the buffer protocol (bytes, bytearray, array)?
             mv = memoryview(body)
@@ -782,13 +771,10 @@ class HTTPConnection:
         except TypeError:
             pass
 
-        if isinstance(body, str):
-            return len(body)
-
         return None
 
-    def __init__(self, host, port=None, timeout=-1,
-                 source_address=None, blocksize=8192):
+    def __init__(self, host, port=None, timeout=socket._GLOBAL_DEFAULT_TIMEOUT,
+                 source_address=None, blocksize=io.DEFAULT_BUFFER_SIZE):
         self.timeout = timeout
         self.source_address = source_address
         self.blocksize = blocksize
@@ -926,8 +912,7 @@ class HTTPConnection:
             (self.host,self.port), self.timeout, self.source_address)
         # Might fail in OSs that don't implement TCP_NODELAY
         try:
-            # self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            pass
+            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         except OSError as e:
             if e.errno != errno.ENOPROTOOPT:
                 raise
@@ -973,7 +958,7 @@ class HTTPConnection:
                 datablock = data.read(self.blocksize)
                 if not datablock:
                     break
-                if encode:
+                if isinstance(datablock, str):
                     datablock = datablock.encode("iso-8859-1")
                 self.sock.sendall(datablock)
             return
@@ -1004,7 +989,7 @@ class HTTPConnection:
             datablock = readable.read(self.blocksize)
             if not datablock:
                 break
-            if encode:
+            if isinstance(datablock, str):
                 datablock = datablock.encode("iso-8859-1")
             yield datablock
 
@@ -1196,24 +1181,24 @@ class HTTPConnection:
     def _validate_method(self, method):
         """Validate a method name for putrequest."""
         # prevent http header injection
-        match = any(map(_contains_disallowed_method_pchar_re, method))
+        match = _contains_disallowed_method_pchar_re(method)
         if match:
             raise ValueError(
-                    f"method can't contain control characters. {repr(method)} (found at least {repr(match.group())})")
+                    f"method can't contain control characters. {repr(method)} (found at least {repr(match[0])})")
 
     def _validate_path(self, url):
         """Validate a url for putrequest."""
         # Prevent CVE-2019-9740.
-        match = any(map(_contains_disallowed_url_pchar_re, url))
+        match = _contains_disallowed_url_pchar_re(url)
         if match:
-            raise InvalidURL(f"URL can't contain control characters. {repr(url)} (found at least {repr(match.group())})")
+            raise InvalidURL(f"URL can't contain control characters. {repr(url)} (found at least {repr(match[0])})")
 
     def _validate_host(self, host):
         """Validate a host so it doesn't contain control characters."""
         # Prevent CVE-2019-18348.
-        match = any(map(_contains_disallowed_url_pchar_re, host))
+        match = _contains_disallowed_url_pchar_re(host)
         if match:
-            raise InvalidURL(f"URL can't contain control characters. {repr(host)} (found at least {repr(match.group())})")
+            raise InvalidURL(f"URL can't contain control characters. {repr(host)} (found at least {repr(match[0])})")
 
     def putheader(self, header, *values):
         """Send a request header line to the server.
@@ -1352,7 +1337,7 @@ class HTTPConnection:
         try:
             try:
                 response.begin()
-            except OSError:
+            except ConnectionError:
                 self.close()
                 raise
             assert response.will_close != _UNKNOWN
@@ -1380,10 +1365,8 @@ else:
 
         default_port = HTTPS_PORT
 
-        # XXX Should key_file and cert_file be deprecated in favour of context?
-
         def __init__(self, host, port=None,
-                     *, timeout=-1,
+                     *, timeout=socket._GLOBAL_DEFAULT_TIMEOUT,
                      source_address=None, context=None, blocksize=8192):
             super(HTTPSConnection, self).__init__(host, port, timeout,
                                                   source_address,
@@ -1405,7 +1388,7 @@ else:
             self.sock = self._context.wrap_socket(self.sock,
                                                   server_hostname=server_hostname)
 
-    __all__.append("HTTPSConnection")
+    __all__ = tuple(list(__all__) + ["HTTPSConnection"])
 
 class HTTPException(Exception):
     # Subclasses that define an __init__ must call Exception.__init__
@@ -1420,7 +1403,7 @@ class InvalidURL(HTTPException):
 
 class UnknownProtocol(HTTPException):
     def __init__(self, version):
-        self.args = version,
+        super(UnknownProtocol, self).__init__(version)
         self.version = version
 
 class UnknownTransferEncoding(HTTPException):
@@ -1431,7 +1414,7 @@ class UnimplementedFileMode(HTTPException):
 
 class IncompleteRead(HTTPException):
     def __init__(self, partial, expected=None):
-        self.args = partial,
+        super(IncompleteRead, self).__init__(partial)
         self.partial = partial
         self.expected = expected
     def __repr__(self):
@@ -1441,6 +1424,8 @@ class IncompleteRead(HTTPException):
             e = ''
         return '%s(%i bytes read%s)' % (self.__class__.__name__,
                                         len(self.partial), e)
+    def __str__(self):
+        return repr(self)
 
 class ImproperConnectionState(HTTPException):
     pass
@@ -1458,15 +1443,15 @@ class BadStatusLine(HTTPException):
     def __init__(self, line):
         if not line:
             line = repr(line)
-        self.args = line,
+        super(BadStatusLine, self).__init__(line)
         self.line = line
 
 class LineTooLong(HTTPException):
-    pass
-    # def __init__(self, line_type):
-    #     HTTPException.__init__(self, "got more than %d bytes when reading %s"
-    #                                  % (_MAXLINE, line_type))
+    def __init__(self, line_type):
+        super(LineTooLong, self).__init__("got more than %d bytes when reading %s"
+                                     % (_MAXLINE, line_type))
 
-class RemoteDisconnected(BadStatusLine):
+class RemoteDisconnected(ConnectionResetError):
     def __init__(self, *pos, **kw):
-        BadStatusLine.__init__(self, "")
+        # BadStatusLine.__init__(self, "")
+        super(ConnectionResetError, self).__init__(*pos, **kw)

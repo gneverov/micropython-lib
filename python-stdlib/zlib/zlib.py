@@ -5,6 +5,7 @@ import io, deflate
 
 _MAX_WBITS = const(15)
 
+error = OSError
 
 def _decode_wbits(wbits, decompress):
     if -15 <= wbits <= -5:

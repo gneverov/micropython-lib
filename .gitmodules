@@ -1,0 +1,3 @@
+[submodule "python-ecosys/microdot"]
+	path = python-ecosys/microdot
+	url = https://github.com/gneverov/microdot.git

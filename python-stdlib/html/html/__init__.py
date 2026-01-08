@@ -2,15 +2,19 @@
 General functions for HTML manipulation.
 """
 
+try:
+    from freeze import frozendict
+except ImportError:
+    frozendict = dict
 
-_escape_map = {ord("&"): "&amp;", ord("<"): "&lt;", ord(">"): "&gt;"}
-_escape_map_full = {
+_escape_map = frozendict({ord("&"): "&amp;", ord("<"): "&lt;", ord(">"): "&gt;"})
+_escape_map_full = frozendict({
     ord("&"): "&amp;",
     ord("<"): "&lt;",
     ord(">"): "&gt;",
     ord('"'): "&quot;",
     ord("'"): "&#x27;",
-}
+})
 
 # NB: this is a candidate for a bytes/string polymorphic interface
 

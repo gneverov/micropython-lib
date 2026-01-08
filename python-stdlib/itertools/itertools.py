@@ -28,9 +28,12 @@ def repeat(el, n=None):
             yield el
 
 
-def chain(*p):
+def chain_from_iterable(p):
     for i in p:
         yield from i
+
+def chain(*p):
+    return chain_from_iterable(p)
 
 
 def islice(p, start, stop=(), step=1):
@@ -72,3 +75,20 @@ def accumulate(iterable, func=lambda x, y: x + y):
     for element in it:
         acc = func(acc, element)
         yield acc
+
+def takewhile(predicate, iterable):
+    for x in iterable:
+        if predicate(x):
+            yield x
+        else:
+            break
+
+def product(*iterables, repeat=1):
+    pools = [tuple(pool) for pool in iterables] * repeat
+
+    result = [[]]
+    for pool in pools:
+        result = [x+[y] for x in result for y in pool]
+
+    for prod in result:
+        yield tuple(prod)

@@ -120,3 +120,10 @@ def _calculate_meta(meta, bases):
             "of the metaclasses of all its bases"
         )
     return winner
+
+def coroutine(gen_func):
+    if isinstance(gen_func, GeneratorType):
+        return gen_func
+    async def coro_wrapper(*args, **kwargs):
+        return gen_func(*args, **kwargs)
+    return coro_wrapper

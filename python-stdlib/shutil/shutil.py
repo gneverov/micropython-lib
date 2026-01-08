@@ -9,12 +9,12 @@ def rmtree(d):
     if not d:
         raise ValueError
 
-    for name, type, *_ in os.ilistdir(d):
-        path = d + "/" + name
-        if type & 0x4000:  # dir
-            rmtree(path)
-        else:  # file
-            os.unlink(path)
+    with os.scandir(d) as it:
+        for entry in it:
+            if entry.is_dir():  # dir
+                rmtree(entry.path)
+            else:  # file
+                os.unlink(entry.path)
     os.rmdir(d)
 
 

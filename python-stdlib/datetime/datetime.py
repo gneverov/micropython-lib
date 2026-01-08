@@ -59,6 +59,8 @@ MAXYEAR = 9_999
 
 
 class timedelta:
+    __immutable__ = True
+
     def __init__(
         self, days=0, seconds=0, microseconds=0, milliseconds=0, minutes=0, hours=0, weeks=0
     ):
@@ -245,6 +247,8 @@ class tzinfo:
 
 
 class timezone(tzinfo):
+    __immutable__ = True
+
     def __init__(self, offset, name=None):
         if not (abs(offset._us) < 86_400_000_000):
             raise ValueError
@@ -305,6 +309,8 @@ def _d2iso(o):  # date -> ISO
 
 
 class date:
+    __immutable__ = True
+
     def __init__(self, year, month, day):
         self._ord = _date(year, month, day)
 
@@ -497,6 +503,8 @@ def _t2iso(td, timespec, dt, tz):
 
 
 class time:
+    __immutable__ = True
+
     def __init__(self, hour=0, minute=0, second=0, microsecond=0, tzinfo=None, *, fold=0):
         self._td = _time(hour, minute, second, microsecond, fold)
         self._tz = tzinfo
@@ -660,6 +668,10 @@ class datetime:
         return cls(
             0, 0, date.toordinal(), 0, 0, 0, time._td._us, tzinfo or time._tz, fold=time._fd
         )
+
+    @classmethod
+    def strptime(date_string, format):
+        return datetime.datetime(*time.strptime(date_string, format)[:6])
 
     @property
     def year(self):
@@ -872,6 +884,3 @@ class datetime:
         d = _o2ymd(self._d)
         t = self._t.tuple()[1:]
         return d + t + (self._tz, self._fd)
-
-
-datetime.EPOCH = datetime(*_tmod.gmtime(0)[:6], tzinfo=timezone.utc)
